@@ -222,8 +222,7 @@ with st.expander("2) Sources", expanded=True):
                 bad.append(str(ve))
         if bad:
             st.error("Some entries are not valid Google Sheets URLs:")
-            st.code("
-".join(bad))
+            st.code("".join(bad))
         sheet_urls = cleaned_urls
         folder_id = ""
 
@@ -277,8 +276,7 @@ with st.expander("4) Template & Filters", expanded=True):
                     df0 = read_df(ws)
                     st.session_state['headers'] = list(df0.columns)
                     st.success("Loaded headers:")
-                    st.code("
-".join(st.session_state['headers']))
+                    st.code("".join(st.session_state['headers']))
 
                     # Show last row preview
                     last_row = get_last_row_data(ws)
