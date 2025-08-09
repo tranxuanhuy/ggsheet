@@ -86,13 +86,12 @@ def summarize_frames(frames: List[pd.DataFrame], key_cols: List[str], date_col: 
         return pd.DataFrame(), []
 
     # Validate headers consistent
-    base_cols = list(frames[0].columns)
     for i, df in enumerate(frames[1:], start=2):
         if list(df.columns) != base_cols:
             raise ValueError(
-                f"Sheet #{i} columns differ from template.
-Expected {base_cols}
-Got {list(df.columns)}"
+                f"Sheet #{i} columns differ from template.\n"
+                f"Expected {base_cols}\n"
+                f"Got {list(df.columns)}"
             )
 
     # Check required cols
