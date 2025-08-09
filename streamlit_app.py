@@ -68,32 +68,54 @@ def read_df(ws) -> pd.DataFrame:
 def to_number_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
 
-def summarize_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
+def summarize_frames(frames: List[pd.DataFrame], key_cols: List[str], date_col: str,
+                      start: datetime, end: datetime) -> Tuple[pd.DataFrame, List[str]]:
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
+
     base_cols = list(frames[0].columns)
     for i, df in enumerate(frames[1:], start=2):
         if list(df.columns) != base_cols:
             raise ValueError(
-                f"Sheet #{i} columns differ from template.\nExpected {base_cols}\nGot {list(df.columns)}"
+                f"Sheet #{i} columns differ from template.\n"
+                f"Expected {base_cols}\n"
+                f"Got {list(df.columns)}"
             )
 
-    all_df = pd.concat(frames, ignore_index=True)
+    # If date filtering is used
+    if date_col and date_col in base_cols:
+        all_df = pd.concat(frames, ignore_index=True)
+        all_df[date_col] = pd.to_datetime(all_df[date_col], errors="coerce")
+        mask = all_df[date_col].apply(lambda d: in_window(d, start, end))
+        all_df = all_df[mask]
+    else:
+        all_df = pd.concat(frames, ignore_index=True)
 
-    # Convert numeric columns
+    if all_df.empty:
+        return pd.DataFrame(columns=base_cols), base_cols
+
+    # Identify numeric columns
     numeric_cols = []
-    for c in all_df.columns:
-        cand = to_number_series(all_df[c])
-        if cand.notna().any():
-            all_df[c] = cand
-            numeric_cols.append(c)
+    for c in base_cols:
+        if c not in key_cols and c != date_col:
+            cand = to_number_series(all_df[c])
+            if cand.notna().any():
+                all_df[c] = cand
+                numeric_cols.append(c)
 
-    # Group by ALL non-numeric columns
-    key_cols = [c for c in all_df.columns if c not in numeric_cols]
     agg_map = {c: "sum" for c in numeric_cols}
-    out = all_df.groupby(key_cols, dropna=False).agg(agg_map).reset_index()
 
-    return out
+    if key_cols:  # Normal behavior: group by keys
+        out = (
+            all_df.groupby(key_cols, dropna=False)
+            .agg(agg_map)
+            .reset_index()
+        )
+    else:  # No keys → just sum all numeric columns
+        sums = all_df.agg(agg_map).to_frame().T
+        out = sums
+
+    return out, base_cols
 
 def write_to_dest(gc, dest_sheet_url: str, dest_tab: str, df: pd.DataFrame):
     sh = gc.open_by_url(dest_sheet_url)
