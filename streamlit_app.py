@@ -26,19 +26,21 @@ from gspread_dataframe import set_with_dataframe
 # Try to import googleapiclient; show a friendly UI hint if missing
 try:
     from googleapiclient.discovery import build  # type: ignore
-except Exception as _e:
+except Exception:
     build = None  # lazy fallback; we'll show guidance in the UI when needed
 
 # ---- Helpers ---------------------------------------------------------------
 
-def get_gc(sa_json_text: str):
+def get_gc_and_creds(sa_json_text: str):
+    """Return (gspread_client, google_credentials) using the same SA JSON."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     info = json.loads(sa_json_text)
     creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+    gc = gspread.authorize(creds)
+    return gc, creds
 
 
 def open_ws_by_url(gc, url: str, tab: str):
@@ -130,6 +132,21 @@ def write_to_dest(gc, dest_sheet_url: str, dest_tab: str, df: pd.DataFrame):
     set_with_dataframe(ws, df if not df.empty else pd.DataFrame(), include_index=False, include_column_header=True)
 
 
+def ensure_destination_sheet(gc, creds, dest_sheet_url: str, fallback_name: str = "Accumulated Report") -> str:
+    """Return a valid destination spreadsheet URL. If empty, auto-create a new Google Sheet."""
+    if dest_sheet_url:
+        return dest_sheet_url
+    if build is None:
+        raise RuntimeError("google-api-python-client not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
+    drive = build("drive", "v3", credentials=creds)
+    file = drive.files().create(
+        body={"name": fallback_name, "mimeType": "application/vnd.google-apps.spreadsheet"},
+        fields="id, webViewLink"
+    ).execute()
+    new_url = f"https://docs.google.com/spreadsheets/d/{file['id']}/edit"
+    return new_url
+
+
 # ---- UI -------------------------------------------------------------------
 
 st.set_page_config(page_title="Sheets Accumulator", page_icon="📊", layout="centered")
@@ -164,7 +181,7 @@ with st.expander("2) Sources", expanded=True):
     source_tab = st.text_input("Source Tab Name", value="RawData")
 
 with st.expander("3) Destination", expanded=True):
-    dest_sheet_url = st.text_input("Destination Spreadsheet URL", placeholder="https://docs.google.com/spreadsheets/d/DEST_ID/edit")
+    dest_sheet_url = st.text_input("Destination Spreadsheet URL (leave blank to auto-create)", placeholder="https://docs.google.com/spreadsheets/d/DEST_ID/edit")
     dest_tab_daily = st.text_input("Destination Tab (Daily)", value="Report_Daily")
     dest_tab_yearly = st.text_input("Destination Tab (Yearly)", value="Report_Yearly")
 
@@ -175,7 +192,7 @@ with st.expander("4) Template & Filters", expanded=True):
             if not sa_json_text:
                 st.error("Provide Service Account JSON first.")
             else:
-                gc = get_gc(sa_json_text)
+                gc, creds = get_gc_and_creds(sa_json_text)
                 if src_mode == "List of Sheet URLs":
                     if not sheet_urls:
                         st.error("Enter at least one source URL.")
@@ -189,7 +206,6 @@ with st.expander("4) Template & Filters", expanded=True):
                             st.error("google-api-python-client is not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
                         else:
                             # Pick first spreadsheet in folder
-                            creds = gc.auth
                             drive = build("drive", "v3", credentials=creds)
                             files = drive.files().list(
                                 q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
@@ -246,14 +262,11 @@ if run_clicked:
         if src_mode == "Folder ID" and not folder_id:
             st.error("Please enter a Drive Folder ID or switch to URLs mode.")
             st.stop()
-        if not dest_sheet_url:
-            st.error("Please enter a destination spreadsheet URL.")
-            st.stop()
         if not key_cols:
             st.error("Select at least one KEY column.")
             st.stop()
 
-        gc = get_gc(sa_json_text)
+        gc, creds = get_gc_and_creds(sa_json_text)
 
         # Collect source dataframes
         frames: List[pd.DataFrame] = []
@@ -266,7 +279,6 @@ if run_clicked:
             if build is None:
                 st.error("google-api-python-client is not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
                 st.stop()
-            creds = gc.auth
             drive = build("drive", "v3", credentials=creds)
             files = drive.files().list(
                 q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
@@ -292,6 +304,10 @@ if run_clicked:
         st.subheader("Preview Result")
         st.dataframe(result_df.head(200))
         st.write(f"Rows: {len(result_df)} | Columns: {len(result_df.columns)}")
+
+        # Ensure destination (auto-create if empty)
+        dest_sheet_url = ensure_destination_sheet(gc, creds, dest_sheet_url)
+        st.info(f"Destination: {dest_sheet_url}")
 
         # Write
         dest_tab = (
