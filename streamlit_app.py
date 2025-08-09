@@ -11,6 +11,7 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
+from typing import List, Tuple
 
 try:
     from googleapiclient.discovery import build
@@ -67,6 +68,60 @@ def read_df(ws) -> pd.DataFrame:
 
 def to_number_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+def summarize_frames(frames: List[pd.DataFrame], key_cols: List[str], date_col: str,
+                      start: datetime, end: datetime) -> Tuple[pd.DataFrame, List[str]]:
+    if not frames:
+        return pd.DataFrame(), []
+
+    base_cols = list(frames[0].columns)
+    for i, df in enumerate(frames[1:], start=2):
+        if list(df.columns) != base_cols:
+            raise ValueError(
+                f"Sheet #{i} columns differ from template.\n"
+                f"Expected {base_cols}\n"
+                f"Got {list(df.columns)}"
+            )
+
+    # If date filtering is used
+    if date_col and date_col in base_cols:
+        all_df = pd.concat(frames, ignore_index=True)
+        all_df[date_col] = pd.to_datetime(all_df[date_col], errors="coerce")
+        mask = all_df[date_col].apply(lambda d: in_window(d, start, end))
+        all_df = all_df[mask]
+    else:
+        all_df = pd.concat(frames, ignore_index=True)
+
+    if all_df.empty:
+        return pd.DataFrame(columns=base_cols), base_cols
+
+    # Identify numeric columns
+    numeric_cols = []
+    for c in base_cols:
+        if c not in key_cols and c != date_col:
+            cand = to_number_series(all_df[c])
+            if cand.notna().any():
+                all_df[c] = cand
+                numeric_cols.append(c)
+
+    agg_map = {c: "sum" for c in numeric_cols}
+
+    if key_cols:  # Normal behavior: group by keys
+        out = (
+            all_df.groupby(key_cols, dropna=False)
+            .agg(agg_map)
+            .reset_index()
+        )
+    else:  # No keys → just sum all numeric columns
+        sums = all_df.agg(agg_map).to_frame().T
+        out = sums
+
+    return out, base_cols
+
+def in_window(d: pd.Timestamp, start: datetime, end: datetime) -> bool:
+    if pd.isna(d):
+        return False
+    return (d.to_pydatetime() >= start) and (d.to_pydatetime() < end)
 
 def summarize_frames(frames: List[pd.DataFrame], key_cols: List[str], date_col: str,
                       start: datetime, end: datetime) -> Tuple[pd.DataFrame, List[str]]:
