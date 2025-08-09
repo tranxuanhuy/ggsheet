@@ -1,6 +1,6 @@
 # streamlit_app.py
 # GUI to accumulate 20+ Google Sheets with the same template, filter by time window (Daily/Yearly/Custom),
-# and write the summed result to a destination sheet.
+# and write the summed result to a destination sheet. Also includes a helper to print the last non-empty row.
 #
 # Deployment tips:
 # - Put this file in a GitHub repo.
@@ -14,6 +14,7 @@
 # - On Streamlit Community Cloud / HF Spaces: add a secret named SA_JSON containing your service-account JSON.
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
@@ -57,6 +58,17 @@ def read_df(ws) -> pd.DataFrame:
     return df
 
 
+def get_last_row_data(ws):
+    """Return the values from the last non-empty row of the worksheet."""
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    # Remove any completely empty rows at the end
+    while all_values and not any(str(cell).strip() for cell in all_values[-1]):
+        all_values.pop()
+    return all_values[-1] if all_values else []
+
+
 def in_window(d: pd.Timestamp, start: datetime, end: datetime) -> bool:
     if pd.isna(d):
         return False
@@ -78,7 +90,9 @@ def summarize_frames(frames: List[pd.DataFrame], key_cols: List[str], date_col: 
     for i, df in enumerate(frames[1:], start=2):
         if list(df.columns) != base_cols:
             raise ValueError(
-                f"Sheet #{i} columns differ from template.\nExpected {base_cols}\nGot {list(df.columns)}"
+                f"Sheet #{i} columns differ from template.
+Expected {base_cols}
+Got {list(df.columns)}"
             )
 
     # Check required cols
@@ -147,6 +161,28 @@ def ensure_destination_sheet(gc, creds, dest_sheet_url: str, fallback_name: str 
     return new_url
 
 
+def normalize_folder_id(s: str) -> str:
+    """Accept either a bare ID or a full URL, return the ID."""
+    if not s:
+        return ""
+    if "/folders/" in s:
+        try:
+            return s.split("/folders/")[1].split("/")[0].split("?")[0]
+        except Exception:
+            return s
+    return s
+
+
+def normalize_sheet_url(u: str) -> str:
+    """Accept a full Google Sheets URL and return a canonical /spreadsheets/d/<id>/edit URL.
+    Raise ValueError if it's not a Google Sheets URL."""
+    u = (u or "").strip()
+    m = re.search(r"https?://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9\-_]+)", u)
+    if not m:
+        raise ValueError(f"Not a Google Sheets URL: {u}")
+    return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/edit"
+
+
 # ---- UI -------------------------------------------------------------------
 
 st.set_page_config(page_title="Sheets Accumulator", page_icon="📊", layout="centered")
@@ -170,18 +206,36 @@ with st.expander("1) Authentication (Service Account JSON)", expanded=True):
 with st.expander("2) Sources", expanded=True):
     src_mode = st.radio("How do you want to specify sources?", ["Folder ID", "List of Sheet URLs"], index=0)
     if src_mode == "Folder ID":
-        folder_id = st.text_input("Google Drive Folder ID", placeholder="e.g. 1AbCDEF...")
-        st.caption("Put all source spreadsheets in this folder.")
+        folder_id_input = st.text_input(
+            "Google Drive Folder ID or URL",
+            placeholder="e.g. 1AbCDEF… or https://drive.google.com/drive/folders/1AbCDEF…",
+        )
+        folder_id = normalize_folder_id(folder_id_input)
+        st.caption("You can paste the full folder URL; we'll extract the ID.")
         sheet_urls: List[str] = []
     else:
         urls_raw = st.text_area("One Google Sheet URL per line", height=120)
-        sheet_urls = [u.strip() for u in urls_raw.splitlines() if u.strip()]
+        # Validate URLs now
+        cleaned_urls, bad = [], []
+        for u in [u.strip() for u in urls_raw.splitlines() if u.strip()]:
+            try:
+                cleaned_urls.append(normalize_sheet_url(u))
+            except ValueError as ve:
+                bad.append(str(ve))
+        if bad:
+            st.error("Some entries are not valid Google Sheets URLs:")
+            st.code("
+".join(bad))
+        sheet_urls = cleaned_urls
         folder_id = ""
 
     source_tab = st.text_input("Source Tab Name", value="RawData")
 
 with st.expander("3) Destination", expanded=True):
-    dest_sheet_url = st.text_input("Destination Spreadsheet URL (leave blank to auto-create)", placeholder="https://docs.google.com/spreadsheets/d/DEST_ID/edit")
+    dest_sheet_url = st.text_input(
+        "Destination Spreadsheet URL (leave blank to auto-create)",
+        placeholder="https://docs.google.com/spreadsheets/d/DEST_ID/edit",
+    )
     dest_tab_daily = st.text_input("Destination Tab (Daily)", value="Report_Daily")
     dest_tab_yearly = st.text_input("Destination Tab (Yearly)", value="Report_Yearly")
 
@@ -195,7 +249,7 @@ with st.expander("4) Template & Filters", expanded=True):
                 gc, creds = get_gc_and_creds(sa_json_text)
                 if src_mode == "List of Sheet URLs":
                     if not sheet_urls:
-                        st.error("Enter at least one source URL.")
+                        st.error("Enter at least one valid source URL.")
                     else:
                         _, ws = open_ws_by_url(gc, sheet_urls[0], source_tab)
                 else:
@@ -207,10 +261,15 @@ with st.expander("4) Template & Filters", expanded=True):
                         else:
                             # Pick first spreadsheet in folder
                             drive = build("drive", "v3", credentials=creds)
-                            files = drive.files().list(
-                                q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                                fields="files(id, name)", pageSize=1
-                            ).execute().get("files", [])
+                            try:
+                                files = drive.files().list(
+                                    q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                                    fields="files(id, name)", pageSize=1,
+                                ).execute().get("files", [])
+                            except Exception as http_e:
+                                st.error("Drive API list failed. Enable **Google Drive API** for your project, then retry. Or use 'List of Sheet URLs' mode.")
+                                st.exception(http_e)
+                                files = []
                             if not files:
                                 st.error("No spreadsheets found in that folder.")
                             else:
@@ -220,7 +279,16 @@ with st.expander("4) Template & Filters", expanded=True):
                     df0 = read_df(ws)
                     st.session_state['headers'] = list(df0.columns)
                     st.success("Loaded headers:")
-                    st.code("\n".join(st.session_state['headers']))
+                    st.code("
+".join(st.session_state['headers']))
+
+                    # Show last row preview
+                    last_row = get_last_row_data(ws)
+                    if last_row:
+                        st.subheader("Last Row in First Source Sheet")
+                        st.code(", ".join([str(x) for x in last_row]))
+                    else:
+                        st.info("First source sheet appears to be empty.")
         except Exception as e:
             st.exception(e)
 
@@ -257,7 +325,7 @@ if run_clicked:
             st.error("Missing Service Account JSON.")
             st.stop()
         if src_mode == "List of Sheet URLs" and not sheet_urls:
-            st.error("Please enter at least one source sheet URL.")
+            st.error("Please enter at least one valid Google Sheets URL.")
             st.stop()
         if src_mode == "Folder ID" and not folder_id:
             st.error("Please enter a Drive Folder ID or switch to URLs mode.")
@@ -280,10 +348,15 @@ if run_clicked:
                 st.error("google-api-python-client is not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
                 st.stop()
             drive = build("drive", "v3", credentials=creds)
-            files = drive.files().list(
-                q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                fields="files(id, name)", pageSize=1000
-            ).execute().get("files", [])
+            try:
+                files = drive.files().list(
+                    q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                    fields="files(id, name)", pageSize=1000,
+                ).execute().get("files", [])
+            except Exception as http_e:
+                st.error("Drive API list failed. Enable **Google Drive API** for your project, then retry. Or use 'List of Sheet URLs' mode.")
+                st.exception(http_e)
+                files = []
             if not files:
                 st.error("No spreadsheets found in the folder.")
                 st.stop()
