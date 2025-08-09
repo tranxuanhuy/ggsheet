@@ -2,20 +2,19 @@
 # GUI to accumulate 20+ Google Sheets with the same template, filter by time window (Daily/Yearly/Custom),
 # and write the summed result to a destination sheet.
 #
-# Deployment tips (see chat message for full steps):
+# Deployment tips:
 # - Put this file in a GitHub repo.
-# - Create requirements.txt with:
+# - Create requirements.txt with (minimum):
 #     streamlit
 #     gspread
 #     gspread-dataframe
 #     pandas
 #     google-auth
-# - On Streamlit Community Cloud: add a secret named SA_JSON containing your service-account JSON.
-# - On Hugging Face Spaces: create a Streamlit Space and add the same secret.
+#     google-api-python-client
+# - On Streamlit Community Cloud / HF Spaces: add a secret named SA_JSON containing your service-account JSON.
 
 import json
-import os
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
 import pandas as pd
@@ -23,6 +22,12 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
+
+# Try to import googleapiclient; show a friendly UI hint if missing
+try:
+    from googleapiclient.discovery import build  # type: ignore
+except Exception as _e:
+    build = None  # lazy fallback; we'll show guidance in the UI when needed
 
 # ---- Helpers ---------------------------------------------------------------
 
@@ -48,12 +53,6 @@ def read_df(ws) -> pd.DataFrame:
     # normalize columns (strip spaces)
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
-
-def extract_sheet_id(url: str) -> str:
-    import re
-    m = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
-    return m.group(1) if m else ""
 
 
 def in_window(d: pd.Timestamp, start: datetime, end: datetime) -> bool:
@@ -186,19 +185,21 @@ with st.expander("4) Template & Filters", expanded=True):
                     if not folder_id:
                         st.error("Enter a Folder ID or switch to URLs mode.")
                     else:
-                        # Pick first spreadsheet in folder
-                        from googleapiclient.discovery import build
-                        creds = gc.auth
-                        drive = build("drive", "v3", credentials=creds)
-                        files = drive.files().list(
-                            q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                            fields="files(id, name)", pageSize=1
-                        ).execute().get("files", [])
-                        if not files:
-                            st.error("No spreadsheets found in that folder.")
+                        if build is None:
+                            st.error("google-api-python-client is not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
                         else:
-                            first_url = f"https://docs.google.com/spreadsheets/d/{files[0]['id']}/edit"
-                            _, ws = open_ws_by_url(gc, first_url, source_tab)
+                            # Pick first spreadsheet in folder
+                            creds = gc.auth
+                            drive = build("drive", "v3", credentials=creds)
+                            files = drive.files().list(
+                                q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                                fields="files(id, name)", pageSize=1
+                            ).execute().get("files", [])
+                            if not files:
+                                st.error("No spreadsheets found in that folder.")
+                            else:
+                                first_url = f"https://docs.google.com/spreadsheets/d/{files[0]['id']}/edit"
+                                _, ws = open_ws_by_url(gc, first_url, source_tab)
                 if 'ws' in locals():
                     df0 = read_df(ws)
                     st.session_state['headers'] = list(df0.columns)
@@ -262,7 +263,9 @@ if run_clicked:
                 frames.append(read_df(ws))
         else:
             # Folder ID mode -> list spreadsheets via Drive API
-            from googleapiclient.discovery import build
+            if build is None:
+                st.error("google-api-python-client is not installed. Add 'google-api-python-client' to requirements.txt and redeploy.")
+                st.stop()
             creds = gc.auth
             drive = build("drive", "v3", credentials=creds)
             files = drive.files().list(
@@ -278,14 +281,24 @@ if run_clicked:
                 frames.append(read_df(ws))
 
         # Summarize
-        result_df, base_cols = summarize_frames(frames, key_cols, date_col, start_dt.astimezone(timezone.utc).replace(tzinfo=None), end_dt.astimezone(timezone.utc).replace(tzinfo=None))
+        result_df, base_cols = summarize_frames(
+            frames,
+            key_cols,
+            date_col,
+            start_dt.astimezone(timezone.utc).replace(tzinfo=None),
+            end_dt.astimezone(timezone.utc).replace(tzinfo=None),
+        )
 
         st.subheader("Preview Result")
         st.dataframe(result_df.head(200))
         st.write(f"Rows: {len(result_df)} | Columns: {len(result_df.columns)}")
 
         # Write
-        dest_tab = dest_tab_daily if mode == "Daily (yesterday)" else (dest_tab_yearly if mode == "Yearly (previous year)" else "Report_Custom")
+        dest_tab = (
+            dest_tab_daily if mode == "Daily (yesterday)" else (
+                dest_tab_yearly if mode == "Yearly (previous year)" else "Report_Custom"
+            )
+        )
         write_to_dest(gc, dest_sheet_url, dest_tab, result_df)
         st.success(f"✅ Wrote {len(result_df)} rows to '{dest_tab}'.")
     except Exception as e:
