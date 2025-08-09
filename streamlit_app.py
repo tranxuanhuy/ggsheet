@@ -35,10 +35,35 @@ def open_ws_by_url(gc, url: str, tab: str):
     return sh, ws
 
 def read_df(ws) -> pd.DataFrame:
-    rows = ws.get_all_records()
-    df = pd.DataFrame(rows)
+    # Get all values from the sheet
+    all_values = ws.get_all_values()
+    if len(all_values) < 5:
+        return pd.DataFrame()  # Not enough rows for headers + data
+
+    # Row 5 is header (index 4 in 0-based Python)
+    headers = all_values[4]
+
+    # Replace blanks with placeholder names and ensure uniqueness
+    headers = [
+        h.strip() if h.strip() else f"Col{idx+1}"
+        for idx, h in enumerate(headers)
+    ]
+    seen = {}
+    for i, h in enumerate(headers):
+        if h in seen:
+            seen[h] += 1
+            headers[i] = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 0
+
+    # Data starts from row 6 (index 5)
+    data = all_values[5:]
+    df = pd.DataFrame(data, columns=headers)
+
+    # Normalize headers
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
 
 def to_number_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
