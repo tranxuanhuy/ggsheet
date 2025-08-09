@@ -1,0 +1,5 @@
+streamlit
+gspread
+gspread-dataframe
+pandas
+google-auth
