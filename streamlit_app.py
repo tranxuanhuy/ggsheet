@@ -36,19 +36,61 @@ def open_ws_by_url(gc, url: str, tab: str):
     return sh, ws
 
 
+def _make_unique_headers(headers: list[str]) -> list[str]:
+    # Replace blanks and make headers unique
+    cleaned = [h.strip() if str(h).strip() else f"Col{i+1}" for i, h in enumerate(headers)]
+    seen = {}
+    out = []
+    for h in cleaned:
+        if h in seen:
+            seen[h] += 1
+            out.append(f"{h}_{seen[h]}")
+        else:
+            seen[h] = 0
+            out.append(h)
+    return out
+
 def read_df(ws) -> pd.DataFrame:
-    """Read sheet with header at row 5 and keep columns A–J."""
+    """Read a sheet whose table header may be on row 4 or row 5 (1-based).
+    - Uses the row with more non-empty header cells as the header row.
+    - Keeps only columns A..J (first 10).
+    - Ensures headers are non-empty and unique.
+    """
     all_values = ws.get_all_values()
-    if len(all_values) < 5:
+    if not all_values:
         return pd.DataFrame()
 
-    headers = all_values[4]  # Row 5 = index 4
-    data_rows = all_values[5:]  # Data starts row 6
-    df = pd.DataFrame(data_rows, columns=headers)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Trim to first 10 columns (A..J)
+    trimmed = [row[:10] for row in all_values]
 
-    # Keep only first 10 columns (A–J)
-    df = df.iloc[:, 0:10]
+    # Candidate header rows: row 4 (index 3) or row 5 (index 4)
+    cand_idxs = []
+    if len(trimmed) > 3:
+        cand_idxs.append(3)
+    if len(trimmed) > 4:
+        cand_idxs.append(4)
+    if not cand_idxs:
+        return pd.DataFrame()
+
+    def nonempty_count(row):
+        return sum(1 for c in row if str(c).strip() != "")
+
+    # Choose the row with more non-empty header cells
+    header_idx = max(cand_idxs, key=lambda i: nonempty_count(trimmed[i]))
+
+    headers = _make_unique_headers(trimmed[header_idx])
+
+    # Data begins the next row
+    data_rows = trimmed[header_idx + 1:]
+
+    # Pad rows to match header length (in case some rows are short)
+    width = len(headers)
+    padded = [row + [""] * (width - len(row)) if len(row) < width else row[:width] for row in data_rows]
+
+    df = pd.DataFrame(padded, columns=headers)
+
+    # Optional: drop rows that are completely empty
+    df = df.loc[(df.astype(str).apply(lambda x: "".join(x).strip(), axis=1) != "")]
     return df
 
 
